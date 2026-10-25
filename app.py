@@ -4,7 +4,7 @@
 - PC, 안드로이드, 아이폰/아이패드 모든 환경 지원
 - 320kbps 초고음질 MP3 변환 및 브라우저 직접 다운로드
 - 다크 모드 / 라이트 모드 완벽 호환
-- 유튜브 403 Forbidden 방지 및 자동 대체 추출 로직 적용
+- 클라우드 서버 봇 방지(쿠키 인증) 및 3단계 자동 대체 추출 지원
 """
 
 import os
@@ -81,36 +81,43 @@ def format_duration(seconds: int) -> str:
     return f"{m}분 {s}초"
 
 
+def get_cookie_file(target_dir: str) -> str:
+    """
+    저장소에 cookies.txt가 있거나, Streamlit Secrets에 등록된 쿠키가 있으면 파일 경로를 반환합니다.
+    """
+    # 1. 프로젝트 폴더 내 cookies.txt 파일 확인
+    local_cookie = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    if os.path.exists(local_cookie):
+        return local_cookie
+    if os.path.exists("cookies.txt"):
+        return "cookies.txt"
+
+    # 2. Streamlit Cloud의 Secrets에 등록된 YOUTUBE_COOKIES 확인
+    try:
+        if "YOUTUBE_COOKIES" in st.secrets:
+            cookie_content = st.secrets["YOUTUBE_COOKIES"]
+            if cookie_content and len(cookie_content.strip()) > 10:
+                cookie_path = os.path.join(target_dir, "secrets_cookies.txt")
+                with open(cookie_path, "w", encoding="utf-8") as f:
+                    f.write(cookie_content)
+                return cookie_path
+    except Exception:
+        pass
+
+    return None
+
+
 def process_youtube_to_mp3(url: str, quality_bitrate: str):
     """
     유튜브 URL에서 오디오를 추출하여 MP3 파일 바이트와 메타데이터를 반환합니다.
-    유튜브의 403 Forbidden 차단을 방지하기 위해 다단계 추출 전략을 사용합니다.
     """
-    # 1. 시도할 다운로드 전략 목록 (403 오류 시 자동 순차 시도)
     download_configs = [
-        # 전략 1: 기본 최고음질 오디오 추출 (가장 안정적, 포맷 251 Opus/140 m4a)
-        {
-            'name': '기본 고음질 스트림',
-            'extractor_args': {},
-        },
-        # 전략 2: web_embedded 및 tv 클라이언트 우회
-        {
-            'name': '웹 임베디드 우회 스트림',
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['web_embedded', 'tv']
-                }
-            },
-        },
-        # 전략 3: mweb 모바일 웹 클라이언트
-        {
-            'name': '모바일 웹 우회 스트림',
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['mweb']
-                }
-            },
-        }
+        # 전략 1: 기본 고음질 오디오 (Opus 251 / m4a 140)
+        {'name': '기본 고음질', 'extractor_args': {}},
+        # 전략 2: 웹 임베디드 및 TV 클라이언트
+        {'name': '임베디드 스트림', 'extractor_args': {'youtube': {'player_client': ['web_embedded', 'tv']}}},
+        # 전략 3: 모바일 웹 클라이언트
+        {'name': '모바일 웹 스트림', 'extractor_args': {'youtube': {'player_client': ['mweb']}}}
     ]
 
     last_error = None
@@ -131,11 +138,16 @@ def process_youtube_to_mp3(url: str, quality_bitrate: str):
                 'no_warnings': True,
             }
 
-            # 전략별 extractor_args 추가
+            # 쿠키 인증 설정 (클라우드 IP 봇 검증 우회용)
+            cookie_file = get_cookie_file(temp_dir)
+            if cookie_file:
+                ydl_opts['cookiefile'] = cookie_file
+
+            # 전략별 추출 인자
             if config.get('extractor_args'):
                 ydl_opts['extractor_args'] = config['extractor_args']
 
-            # Node.js 런타임이 설치되어 있다면 서명 암호 해독 활성화
+            # Node.js 런타임 활성화
             if shutil.which('node'):
                 ydl_opts['js_runtimes'] = {'node': {}}
 
@@ -147,7 +159,7 @@ def process_youtube_to_mp3(url: str, quality_bitrate: str):
                     duration = info.get('duration', 0)
                     thumbnail = info.get('thumbnail', None)
 
-                # 생성된 .mp3 파일 찾기
+                # 생성된 .mp3 파일 탐색
                 mp3_files = [f for f in os.listdir(temp_dir) if f.lower().endswith('.mp3')]
                 if not mp3_files:
                     raise FileNotFoundError("MP3 변환 파일을 찾을 수 없습니다.")
@@ -170,13 +182,12 @@ def process_youtube_to_mp3(url: str, quality_bitrate: str):
 
             except Exception as e:
                 last_error = e
-                # 403 Forbidden 오류가 발생하면 다음 전략으로 자동 전환
+                # 403 Forbidden 오류 발생 시 다음 전략으로 시도
                 if "403" in str(e):
                     continue
                 else:
                     raise e
 
-    # 모든 전략 실패 시 최종 오류 전달
     raise last_error
 
 
@@ -225,8 +236,18 @@ if convert_btn:
             except Exception as e:
                 st.session_state.conversion_result = None
                 error_msg = str(e)
-                if "Sign in to confirm you're not a bot" in error_msg or "403" in error_msg:
-                    st.error("❌ 유튜브 봇 방지 정책(403 Forbidden)으로 인해 다운로드가 일시 차단되었습니다. 다른 영상으로 시도하거나 잠시 후 다시 시도해 주세요.")
+                if "Sign in to confirm you're not a bot" in error_msg or "Sign in to confirm" in error_msg:
+                    st.error("❌ 유튜브 봇 방지 보안 정책(클라우드 IP 차단)으로 인해 다운로드가 일시 차단되었습니다.")
+                    with st.expander("❓ 'Sign in to confirm you’re not a bot' 오류 해결 방법"):
+                        st.markdown("""
+                        유튜브는 **스트림릿 클라우드(Amazon AWS 서버 IP)** 에서 들어오는 대량의 다운로드 요청을 봇(매크로)으로 인식하여 차단합니다.
+                        
+                        **해결 방법:**
+                        1. **쿠키 파일(cookies.txt) 추가**: 유튜브에 로그인된 브라우저에서 쿠키를 추출해 저장소에 `cookies.txt`로 올리거나, Streamlit Settings의 Secrets에 등록하면 클라우드 서버에서도 차단 없이 이용 가능합니다.
+                        2. **내 컴퓨터(로컬)에서 주소 열기**: 일반 가정용 인터넷(PC)에서는 유튜브의 봇 검증 차단이 전혀 발생하지 않습니다.
+                        """)
+                elif "403" in error_msg:
+                    st.error("❌ 유튜브 스트리밍 주소 접근이 거부되었습니다(403 Forbidden). 잠시 후 다시 시도해 주세요.")
                 elif "Video unavailable" in error_msg:
                     st.error("❌ 영상을 찾을 수 없거나 비공개/삭제된 영상입니다.")
                 else:
@@ -266,7 +287,7 @@ if st.session_state.conversion_result:
         st.session_state.conversion_result = None
         st.rerun()
 
-# 이용 안내 가이드 (다크모드/라이트모드 자동 대응 st.info)
+# 이용 안내 가이드 (다크모드/라이트모드 자동 대응)
 st.markdown("---")
 st.info("""
 **💡 기기별 다운로드 안내**
